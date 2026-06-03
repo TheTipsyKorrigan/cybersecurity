@@ -13,23 +13,26 @@ https://en.wikipedia.org/wiki/EMV#Application_selection
 
 """
 import logging
+import sys
 from smartcard.System import readers
-from smartcard.util import toHexString, toBytes
 
 from read_card import ReadData
 
 LOG_FORMAT = "%(asctime)s: %(levelname)s - %(message)s"
 logging.basicConfig(level=logging.CRITICAL, format=LOG_FORMAT)
 
-# Retrieve the list of available readers
 r = readers()
 print(r)
 
-# Create a connection with the first reader (index 0 for reader 1)
+if not r:
+    print("No card readers found.")
+    sys.exit(1)
+
 connection = r[0].createConnection()
 connection.connect()
 
-card = ReadData(connection, "VISA")
+# Pass a card_type (e.g. "VISA") to target a specific app, or omit to auto-detect.
+card = ReadData(connection)
 card.atr_content()
-card.card_content()
-card.read_file_structure()
+if card.card_content():
+    card.read_file_structure()
