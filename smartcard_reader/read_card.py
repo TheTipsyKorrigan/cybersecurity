@@ -23,11 +23,15 @@ class ReadData:
         with open(responses_path) as f:
             self._apdu_responses = json.load(f)
 
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+
     def atr_content(self):
         """
         The Answer To Reset (ATR) is described in the ISO7816-3 standard.
-        The first bytes describe the voltage convention (direct or inverse),
-        followed by interface bytes and historical bytes.
+        The first bytes describe the voltage convention, followed by interface
+        bytes and historical bytes.
         """
         atr = ATR(self.connection.getATR())
         print("--------------------------------------------------------------------------")
@@ -45,30 +49,34 @@ class ReadData:
 
     def card_content(self):
         """
-        Select an application by AID. If card_type is None, tries all known AIDs.
+        Select an application on the card.
+        - If card_type is set: selects that specific AID directly.
+        - Otherwise: tries PSE discovery first, then falls back to the AID dictionary.
         Returns True if an application was successfully selected.
         """
-        candidates = [self.card_type] if self.card_type else list(self.AID.keys())
+        if self.card_type:
+            candidates = [(self.AID[self.card_type], self.card_type)]
+        else:
+            candidates = self._discover_via_pse() or [
+                (aid, name) for name, aid in self.AID.items()
+            ]
 
-        for card_type in candidates:
-            aid = self.AID[card_type]
-            apdu = [0x00, 0xA4, 0x04, 0x00] + [len(aid)] + aid + [0x00]
+        for aid_bytes, label in candidates:
+            apdu = [0x00, 0xA4, 0x04, 0x00, len(aid_bytes)] + list(aid_bytes) + [0x00]
             try:
                 data, sw1, sw2 = self.connection.transmit(apdu)
+
+                if sw1 == 0x61:
+                    _, sw1, sw2 = self.connection.transmit([0x00, 0xC0, 0x00, 0x00, sw2])
+
                 desc = self.get_apdu_response(sw1, sw2)
-                print("%-15s | %02X %02X: %s - %s" % (card_type, sw1, sw2, desc[0], desc[1]))
+                print("%-20s | %02X %02X: %s - %s" % (label, sw1, sw2, desc[0], desc[1]))
 
                 if sw1 == 0x90:
-                    self.card_type = card_type
+                    self.card_type = label
                     return True
-                elif sw1 == 0x61:
-                    # Data available — fetch it with GET RESPONSE
-                    _, sw1, sw2 = self.connection.transmit([0x00, 0xC0, 0x00, 0x00, sw2])
-                    if sw1 == 0x90:
-                        self.card_type = card_type
-                        return True
             except Exception as e:
-                logging.error("Error selecting %s: %s" % (card_type, e))
+                logging.error("Error selecting %s: %s" % (label, e))
 
         print("No known application found on this card.")
         return False
@@ -86,36 +94,23 @@ class ReadData:
                 data, sw1, sw2 = self.connection.transmit([0x00, 0xB2, p1, p2, 0x00])
 
                 if sw1 == 0x6A and sw2 == 0x83:
-                    # No more records for this SFI
                     logging.debug("SFI %02d | rec %02d: record not found" % (sfi, rec))
                     break
 
                 elif sw1 == 0x6D and sw2 == 0x00:
-                    # Card does not support READ RECORD at all
                     print("READ RECORD not supported on this card.")
                     return
 
                 elif sw1 == 0x6C:
-                    # Wrong Le — retry with the correct length indicated by sw2
                     data, sw1, sw2 = self.connection.transmit([0x00, 0xB2, p1, p2, sw2])
-                    if sw1 != 0x90:
-                        logging.debug("SFI %02d | rec %02d: retry failed (%02X %02X)" % (sfi, rec, sw1, sw2))
-                        continue
-                    self._print_record(sfi, rec, data)
+                    if sw1 == 0x90:
+                        self._print_record(sfi, rec, data)
 
                 elif sw1 == 0x90:
                     self._print_record(sfi, rec, data)
 
                 else:
                     logging.debug("SFI %02d | rec %02d: %02X %02X" % (sfi, rec, sw1, sw2))
-
-    def _print_record(self, sfi, rec, data):
-        hex_str = toHexString(data)
-        ascii_str = ''.join(
-            chr(b) if 0x20 <= b <= 0x7E else '.' for b in data
-        )
-        print("SFI %02d | Rec %02d | hex: %s" % (sfi, rec, hex_str))
-        print("              | asc: %s" % ascii_str)
 
     def get_apdu_response(self, sw1, sw2):
         hex_sw1 = "%02X" % sw1
@@ -127,3 +122,141 @@ class ReadData:
         else:
             description = entry.get(hex_sw2, "Unknown response")
         return response_type, description
+
+    # -------------------------------------------------------------------------
+    # PSE discovery
+    # -------------------------------------------------------------------------
+
+    def _discover_via_pse(self):
+        """
+        Discover AIDs using the Payment System Environment directory.
+        Tries the contact PSE (1PAY.SYS.DDF01) then contactless (2PAY.SYS.DDF01).
+        Returns a list of (aid_bytes, label) tuples, or None if PSE is not supported.
+        """
+        for pse_name in ["1PAY.SYS.DDF01", "2PAY.SYS.DDF01"]:
+            aids = self._read_pse(pse_name)
+            if aids is not None:
+                return aids
+        return None
+
+    def _read_pse(self, pse_name):
+        """
+        Select a PSE directory and read its records to collect AIDs.
+        Returns a list of (aid_bytes, label) tuples, or None if not found/supported.
+        """
+        pse_bytes = [ord(c) for c in pse_name]
+        apdu = [0x00, 0xA4, 0x04, 0x00, len(pse_bytes)] + pse_bytes + [0x00]
+        data, sw1, sw2 = self.connection.transmit(apdu)
+
+        if sw1 == 0x61:
+            data, sw1, sw2 = self.connection.transmit([0x00, 0xC0, 0x00, 0x00, sw2])
+
+        if sw1 != 0x90:
+            return None
+
+        print("PSE found: %s" % pse_name)
+
+        # FCI contains tag 88 = SFI of the directory file
+        sfi_data = self._tlv_find(data, 0x88)
+        if not sfi_data:
+            return None
+
+        sfi = sfi_data[0]
+        aids = []
+
+        for rec in range(1, 17):
+            p2 = (sfi << 3) | 4
+            rec_data, sw1, sw2 = self.connection.transmit([0x00, 0xB2, rec, p2, 0x00])
+
+            if sw1 == 0x6C:
+                rec_data, sw1, sw2 = self.connection.transmit([0x00, 0xB2, rec, p2, sw2])
+
+            if sw1 == 0x6A and sw2 == 0x83:
+                break
+
+            if sw1 != 0x90:
+                continue
+
+            # Each record is a 70 template containing 61 application templates.
+            # Each 61 contains: 4F (AID), 50 (label), 87 (priority).
+            for app in self._tlv_find_all(rec_data, 0x61):
+                aid_bytes = self._tlv_find(app, 0x4F)
+                label_bytes = self._tlv_find(app, 0x50)
+                if aid_bytes:
+                    label = bytes(label_bytes).decode('ascii', errors='replace') if label_bytes else toHexString(list(aid_bytes))
+                    print("  Discovered: %-20s %s" % (label, toHexString(list(aid_bytes))))
+                    aids.append((list(aid_bytes), label))
+
+        return aids if aids else None
+
+    # -------------------------------------------------------------------------
+    # TLV helpers
+    # -------------------------------------------------------------------------
+
+    def _tlv_parse(self, data):
+        """Parse a TLV sequence into a list of (tag, value) tuples."""
+        result = []
+        i = 0
+        while i < len(data):
+            tag = data[i]
+            i += 1
+            # Multi-byte tag: lower 5 bits all set means tag continues
+            if (tag & 0x1F) == 0x1F:
+                while i < len(data):
+                    b = data[i]
+                    tag = (tag << 8) | b
+                    i += 1
+                    if not (b & 0x80):
+                        break
+
+            if i >= len(data):
+                break
+
+            # Length
+            l = data[i]
+            i += 1
+            if l & 0x80:
+                num_bytes = l & 0x7F
+                l = 0
+                for _ in range(num_bytes):
+                    if i >= len(data):
+                        break
+                    l = (l << 8) | data[i]
+                    i += 1
+
+            value = data[i:i + l]
+            result.append((tag, value))
+            i += l
+
+        return result
+
+    def _tlv_find(self, data, target_tag):
+        """Return the value of the first occurrence of target_tag, searching recursively."""
+        for tag, value in self._tlv_parse(data):
+            if tag == target_tag:
+                return value
+            if tag & 0x20:  # constructed tag — search inside
+                result = self._tlv_find(value, target_tag)
+                if result is not None:
+                    return result
+        return None
+
+    def _tlv_find_all(self, data, target_tag):
+        """Return values of all occurrences of target_tag, searching recursively."""
+        results = []
+        for tag, value in self._tlv_parse(data):
+            if tag == target_tag:
+                results.append(value)
+            if tag & 0x20:
+                results.extend(self._tlv_find_all(value, target_tag))
+        return results
+
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+
+    def _print_record(self, sfi, rec, data):
+        hex_str = toHexString(data)
+        ascii_str = ''.join(chr(b) if 0x20 <= b <= 0x7E else '.' for b in data)
+        print("SFI %02d | Rec %02d | hex: %s" % (sfi, rec, hex_str))
+        print("              | asc: %s" % ascii_str)
